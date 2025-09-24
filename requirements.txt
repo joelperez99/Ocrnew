@@ -1,0 +1,4 @@
+Flask==3.0.3
+pytesseract==0.3.13
+pillow==10.4.0
+pandas==2.2.2
