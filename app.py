@@ -1,8 +1,6 @@
 # app.py
 # Flask webapp: subes una imagen (orden ML) -> devuelve tabla (SKU, Título, Unidades, Marketplace, Envío)
-
-import io
-import re
+import io, re, unicodedata
 from typing import Dict, Any, List, Tuple
 
 from flask import Flask, request, render_template_string, send_file
@@ -11,18 +9,30 @@ import pytesseract
 import pandas as pd
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB
 
-# --- Catálogo básico (mapeo por palabras clave -> (SKU, Título canónico)) ---
-CATALOGO = [
-    # (palabras clave en minúsculas, SKU, título canónico)
-    (["lechelak", "cabra", "340"], "7501468144501", "LecheLak - Leche de Cabra en Polvo 340gr"),
-    (["crecelac", "0-12", "800"], "7501468140442", "Crecelac 0-12 M 800 GR"),
-    (["crecelac", "0-12", "400"], "7501468145508", "Crecelac 0-12 M 400 GR"),
-    (["crecelac", "firstep", "1-3", "360"], "7501468148103", "Crecelac FIRSTEP 1-3 AÑOS 360 GR"),
-    (["crecelac", "firstep", "1-3", "800"], "7501468148301", "Crecelac FIRSTEP 1-3 AÑOS 800 GR"),
-    (["crecelac", "0-12", "1.5"], "7501468141043", "Crecelac 0-12 M 1.5 KG"),
-    (["crecelac", "firstep", "1.5"], "7501468140947", "Crecelac FIRSTEP 1-3 AÑOS 1.5 KG"),
-]
+# ====== CATÁLOGO (SKU -> Descripción Producto) ======
+CATALOGO_SKU: Dict[str, str] = {
+    "7501468140442": "CRECELAC 0-12 M 800 GR",
+    "7501468145508": "CRECELAC 0-12 M 400 GR",
+    "7501468148103": "CRECELAC FIRSTEP 1-3 AÑOS 360 GR",
+    "7501468148301": "CRECELAC FIRSTEP 1-3 AÑOS 800 GR",
+    "7501468141043": "CRECELAC 0-12 M 1.5 KG",
+    "7501468140947": "CRECELAC FIRSTEP 1-3 AÑOS 1.5 KG",
+    "7501468144501": "LECHELAK LECHE DE CABRA 340 G",
+}
+
+# Precomputo tokens de descripciones para poder hacer match si no hay EAN
+def _normalize(txt: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", txt.lower())
+        if c.isalnum() or c.isspace()
+    )
+
+DESC_TOKENS = {
+    sku: set(_normalize(desc).split())
+    for sku, desc in CATALOGO_SKU.items()
+}
 
 MARKETPLACE_CONST = "Mercadolibre"
 
@@ -93,64 +103,58 @@ def preprocess(img: Image.Image) -> Image.Image:
     g = ImageOps.autocontrast(g)
     g = g.filter(ImageFilter.MedianFilter(size=3))
     w, h = g.size
-    if max(w, h) < 1600:
-        scale = 1600 / max(w, h)
+    if max(w, h) > 1800:
+        scale = 1800 / max(w, h)
         g = g.resize((int(w * scale), int(h * scale)))
     return g
 
-def ocr_text_from_image(pil_img: Image.Image) -> Tuple[str, List[Dict[str, Any]]]:
-    data = pytesseract.image_to_data(pil_img, lang="spa", output_type=pytesseract.Output.DICT)
-    words = [w for w, conf in zip(data["text"], data["conf"]) if w and str(conf).isdigit() and int(conf) >= 40]
-    text = " ".join(words)
-    return text, data
+def ocr_text_from_image(pil_img: Image.Image) -> str:
+    # OCR más robusto en español
+    return pytesseract.image_to_string(
+        pil_img, lang="spa", config="--oem 1 --psm 6"
+    )
 
 EAN13_RE = re.compile(r"\b(7\d{12})\b")
 UNITS_RE = re.compile(r"(\d+)\s*(?:unid(?:ad|ades)?)\b", re.IGNORECASE)
 ENVIO_LINE_RE = re.compile(r"(env[ií]o[^\n]{0,60})", re.IGNORECASE)
 
-def score_match(title_lower: str, keywords: List[str]) -> int:
-    return sum(1 for k in keywords if k in title_lower)
-
-def guess_from_catalog(title: str) -> Tuple[str, str]:
-    tl = title.lower()
-    best = ("", "")
-    best_score = 0
-    for keys, sku, canonical in CATALOGO:
-        sc = score_match(tl, keys)
-        if sc > best_score:
-            best_score = sc
-            best = (sku, canonical)
-    return best
-
-def find_title(text: str) -> str:
-    cand = re.findall(r"([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚñáéíóú0-9\s\-\(\)\/]{15,})", text)
-    brand_words = ("crecelac", "lechelak", "fórmula", "formula", "cabra")
-    best = ""
-    for c in cand:
-        lower = c.lower()
-        if any(b in lower for b in brand_words) and len(c) > len(best):
-            best = c.strip()
-    if not best and cand:
-        best = max(cand, key=len).strip()
-    return best or "Título no detectado"
+def best_catalog_match(ocr_text: str) -> Tuple[str, str]:
+    """
+    Cuando NO hay EAN: calcula intersección de tokens del OCR contra
+    los tokens de cada descripción de catálogo y devuelve el mejor.
+    """
+    tokens_text = set(_normalize(ocr_text).split())
+    best_sku, best_desc, best_score = "", "", 0
+    for sku, desc_tokens in DESC_TOKENS.items():
+        score = len(tokens_text & desc_tokens)
+        if score > best_score:
+            best_score = score
+            best_sku, best_desc = sku, CATALOGO_SKU[sku]
+    return best_sku, best_desc
 
 def extract_fields(full_text: str) -> Dict[str, Any]:
-    m_ean = EAN13_RE.search(full_text)
-    sku = m_ean.group(1) if m_ean else ""
-    title = find_title(full_text)
+    # Unidades
     m_u = UNITS_RE.search(full_text)
     unidades = int(m_u.group(1)) if m_u else 1
+
+    # Envío
     m_env = ENVIO_LINE_RE.search(full_text.replace("  ", " "))
     envio = m_env.group(1).strip() if m_env else "Mercado Envíos"
-    if not sku and title:
-        sku_guess, canonical = guess_from_catalog(title)
-        if sku_guess:
-            sku = sku_guess
-            if score_match(title.lower(), [w for w in canonical.lower().split()]) < 3:
-                title = canonical
+
+    # SKU por EAN
+    m_ean = EAN13_RE.search(full_text)
+    if m_ean:
+        sku = m_ean.group(1)
+        titulo = CATALOGO_SKU.get(sku, "Título no encontrado en catálogo")
+    else:
+        # Sin EAN → buscar mejor coincidencia por descripción
+        sku, titulo = best_catalog_match(full_text)
+        if not sku:
+            sku, titulo = "No detectado", "Título no detectado"
+
     return {
-        "SKU": sku or "No detectado",
-        "Título de la publicación": title,
+        "SKU": sku,
+        "Título de la publicación": titulo,  # SIEMPRE tomado del catálogo
         "Unidades": unidades,
         "Marketplace": MARKETPLACE_CONST,
         "Envío": envio,
@@ -174,14 +178,18 @@ def index():
     file = request.files.get("image")
     if not file:
         return render_template_string(HTML, preview=None)
+
     img = Image.open(file.stream).convert("RGB")
     pre = preprocess(img)
-    text, _ = ocr_text_from_image(pre)
+    text = ocr_text_from_image(pre)
+
     row = extract_fields(text)
     df = pd.DataFrame([row])
+
     table_html = df.to_html(index=False)
     preview_b64 = img_to_base64(img)
     csv_b64 = df_to_b64_csv(df)
+
     return render_template_string(
         HTML,
         preview=preview_b64,
