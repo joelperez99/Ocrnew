@@ -1,31 +1,77 @@
-name: Build and Deploy to Azure
+name: Build & Deploy to Azure Container Apps (GHCR)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+
+env:
+  APP_NAME: ocrn                 # <-- NOMBRE de tu Container App en Azure
+  RESOURCE_GROUP: ocr-rg         # <-- NOMBRE de tu Resource Group
+  ENV_NAME: ocr-env              # <-- NOMBRE de tu Container Apps Environment
+  TARGET_PORT: "8000"            # <-- Puerto donde escucha Flask
+  IMAGE_NAME: ocrn               # <-- Nombre de la imagen (libre)
 
 jobs:
-  build-and-deploy:
+  build-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Log in to Azure
+      - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build and push Docker image
-        uses: azure/container-apps-deploy-action@v1
+      # ---- GHCR login (GitHub Container Registry) ----
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
-          appSourcePath: .
-          dockerfilePath: ./Dockerfile
-          registryUrl: ${{ secrets.REGISTRY_URL }}
-          registryUsername: ${{ secrets.REGISTRY_USERNAME }}
-          registryPassword: ${{ secrets.REGISTRY_PASSWORD }}
-          containerAppName: ocrn
-          resourceGroup: <TU_RESOURCE_GROUP>
-          imageToBuild: ${{ secrets.REGISTRY_URL }}/ocrn:${{ github.sha }}
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      # ---- Build & push Docker image to GHCR ----
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ secrets.GHCR_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # ---- Create (if needed) or Update Container App ----
+      - name: Create or Update Container App
+        shell: bash
+        run: |
+          set -e
+          IMAGE="ghcr.io/${{ secrets.GHCR_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+          # Si ya existe, actualiza; si no, crea con ingress externo
+          if az containerapp show -n "${{ env.APP_NAME }}" -g "${{ env.RESOURCE_GROUP }}" >/dev/null 2>&1; then
+            echo "Actualizando imagen en Container App existente..."
+            az containerapp registry set \
+              --server ghcr.io \
+              --username "${{ secrets.GHCR_USERNAME }}" \
+              --password "${{ secrets.GHCR_TOKEN }}" \
+              -n "${{ env.APP_NAME }}" -g "${{ env.RESOURCE_GROUP }}"
+            az containerapp update \
+              -n "${{ env.APP_NAME }}" -g "${{ env.RESOURCE_GROUP }}" \
+              --image "$IMAGE" \
+              --set-probe-tcp "${{ env.TARGET_PORT }}"
+          else
+            echo "Creando Container App con ingress externo..."
+            az containerapp create \
+              -n "${{ env.APP_NAME }}" -g "${{ env.RESOURCE_GROUP }}" \
+              --environment "${{ env.ENV_NAME }}" \
+              --image "$IMAGE" \
+              --ingress external --target-port "${{ env.TARGET_PORT }}" \
+              --registry-server ghcr.io \
+              --registry-username "${{ secrets.GHCR_USERNAME }}" \
+              --registry-password "${{ secrets.GHCR_TOKEN }}"
+          fi
+
+          echo "Deploy listo ✅"
+
+
