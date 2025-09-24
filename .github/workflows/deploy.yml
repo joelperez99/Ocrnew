@@ -1,0 +1,31 @@
+name: Build and Deploy to Azure
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build and push Docker image
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: .
+          dockerfilePath: ./Dockerfile
+          registryUrl: ${{ secrets.REGISTRY_URL }}
+          registryUsername: ${{ secrets.REGISTRY_USERNAME }}
+          registryPassword: ${{ secrets.REGISTRY_PASSWORD }}
+          containerAppName: ocrn
+          resourceGroup: <TU_RESOURCE_GROUP>
+          imageToBuild: ${{ secrets.REGISTRY_URL }}/ocrn:${{ github.sha }}
